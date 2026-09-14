@@ -1,0 +1,143 @@
+from datetime import datetime
+from io import StringIO
+import pandas as pd
+import requests
+import yfinance as yf
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+GLOBAL_INDICES = {
+    "US (S&P 500)": "^GSPC",
+    "China": "000001.SS",
+    "Hong Kong": "^HSI",
+    "Australia": "^AXJO",
+    "India": "^NSEI",
+    "Canada": "^GSPTSE",
+    "Germany": "^GDAXI",
+    "United Kingdom": "^FTSE",
+    "Japan": "^N225",
+    "Mexico": "^MXX",
+    "Brazil": "^BVSP",
+}
+
+
+def get_sp500_recent_additions(min_year: int = 2020) -> pd.Series:
+    """Fetch S&P 500 components from Wikipedia and count additions per year."""
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    response = requests.get(url, headers=HEADERS, timeout=10)
+    response.raise_for_status()
+
+    sp500_table = pd.read_html(StringIO(response.text))[0]
+    years = pd.to_datetime(sp500_table["Date added"], errors="coerce").dt.year
+    counts = years.value_counts().sort_index(ascending=False)
+
+    return counts[counts.index >= min_year]
+
+
+def get_global_index_returns(
+    start_date: str = None, 
+    end_date: str = None
+) -> pd.Series:
+    """Calculate returns for major global indices over a date range."""
+    today = datetime.today()
+    if start_date is None:
+        start_date = f"{today.year}-01-01"
+    if end_date is None:
+        end_date = today.strftime("%Y-%m-%d")
+
+    results = {}
+    for name, symbol in GLOBAL_INDICES.items():
+        hist = yf.Ticker(symbol).history(
+            start=start_date, end=end_date, auto_adjust=False
+        )
+        if len(hist) >= 2:
+            close = hist["Close"]
+            results[name] = ((close.iloc[-1] / close.iloc[0]) - 1) * 100
+
+    return pd.Series(results).sort_values(ascending=False)
+
+
+def get_sp500_corrections(
+    start_date: str = "1950-01-01", 
+    min_drawdown_pct: float = 5.0
+) -> pd.DataFrame:
+    """Identify market corrections between successive all-time highs."""
+    sp500 = yf.Ticker("^GSPC").history(start=start_date, auto_adjust=False)
+    close = sp500["Close"]
+    ath = close[close == close.cummax()]
+
+    records = []
+    for high_date, next_high_date in zip(ath.index[:-1], ath.index[1:]):
+        window = close.loc[high_date:next_high_date]
+        low_date = window.idxmin()
+        high_price = close.loc[high_date]
+        low_price = window.min()
+
+        drawdown = ((high_price - low_price) / high_price) * 100
+        if drawdown >= min_drawdown_pct:
+            records.append({
+                "high_date": high_date.date(),
+                "low_date": low_date.date(),
+                "drawdown_pct": round(drawdown, 2),
+                "duration_days": (low_date - high_date).days,
+            })
+
+    return pd.DataFrame(records)
+
+
+def analyze_earnings_reaction(ticker_symbol: str = "AMZN") -> pd.DataFrame:
+    """Analyze 2-day price reactions following positive earnings surprises."""
+    ticker = yf.Ticker(ticker_symbol)
+
+    earnings = ticker.get_earnings_dates(limit=25)
+    if earnings is None or earnings.empty:
+        return pd.DataFrame()
+
+    earnings = earnings.dropna(subset=["Surprise(%)"]).copy()
+    earnings.index = (
+        pd.to_datetime(earnings.index, utc=True)
+        .tz_convert(None)
+        .normalize()
+    )
+
+    earliest_date = earnings.index.min().strftime("%Y-%m-%d")
+    prices = ticker.history(start=earliest_date, auto_adjust=False)
+    prices.index = (
+        pd.to_datetime(prices.index, utc=True)
+        .tz_convert(None)
+        .normalize()
+    )
+
+    # 2-day return: Day+1 close relative to Day-1 close
+    prices["two_day_return_pct"] = (
+        (prices["Close"].shift(-1) / prices["Close"].shift(1)) - 1
+    ) * 100
+
+    analysis = earnings.join(prices[["two_day_return_pct"]], how="left")
+    return analysis[analysis["Surprise(%)"] > 0]
+
+
+if __name__ == "__main__":
+    print("=== S&P 500 Additions (>= 2020) ===")
+    print(get_sp500_recent_additions())
+
+    print("\n=== Global Indices Returns (YTD) ===")
+    returns = get_global_index_returns()
+    print(returns.round(2).to_string())
+
+    us_return = returns.get("US (S&P 500)")
+    if us_return is not None:
+        beat_us = returns.drop("US (S&P 500)") > us_return
+        print(f"\nMarkets outperforming US: {beat_us.sum()}/{len(beat_us)}")
+
+    print("\n=== Historical S&P 500 Corrections (>= 5%) ===")
+    corrections = get_sp500_corrections()
+    print(corrections.describe().round(2))
+    print("\nTop 5 Largest Corrections:")
+    print(corrections.sort_values("drawdown_pct", ascending=False).head(5).to_string(index=False))
+
+    print("\n=== AMZN Earnings Surprise Reaction ===")
+    earnings_df = analyze_earnings_reaction("AMZN")
+    cols = ["Surprise(%)", "two_day_return_pct"]
+    print(earnings_df[cols].round(2).to_string())
+    print("Median 2-Day Return (%):", round(earnings_df["two_day_return_pct"].median(), 2))
