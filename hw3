@@ -1,0 +1,661 @@
+
+# ============================================================
+# Stock Markets Analytics Zoomcamp 2026
+# Module 3 Homework — Questions 1–5
+# ============================================================
+
+from pathlib import Path
+import warnings
+
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    classification_report,
+)
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+
+# ============================================================
+# 0. CONFIGURATION — EDIT THIS PATH
+# ============================================================
+
+DATA_PATH = Path(
+    r"C:\Users\user\OneDrive\Desktop\Zoomcamps\Stock Market Analytics\stocks_df_combined_2026_09_18.parquet.brotli"
+)
+
+TARGET = "is_positive_growth_30d_future"
+RANDOM_STATE = 42
+TEST_SIZE = 0.20
+
+
+# ============================================================
+# 1. LOAD AND VALIDATE DATA
+# ============================================================
+
+def load_dataset(path):
+    """Load the Parquet dataset and validate the required columns."""
+
+    path = Path(path).expanduser()
+
+    if not path.is_file():
+        raise FileNotFoundError(
+            "\nDataset not found.\n"
+            f"Path supplied:\n{path}\n\n"
+            "Update DATA_PATH at the beginning of this script."
+        )
+
+    print("=" * 70)
+    print("LOADING DATASET")
+    print("=" * 70)
+    print(f"File: {path}")
+
+    df = pd.read_parquet(path)
+
+    print(f"Rows: {len(df):,}")
+    print(f"Columns: {len(df.columns):,}")
+    print(f"Shape: {df.shape}")
+
+    if TARGET not in df.columns:
+        raise ValueError(
+            f"Target column '{TARGET}' was not found.\n"
+            f"Available columns:\n{df.columns.tolist()}"
+        )
+
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+
+    print("\nFirst five rows:")
+    print(df.head())
+
+    print("\nTarget distribution:")
+    print(df[TARGET].value_counts(dropna=False))
+
+    print("\nTarget proportions:")
+    print(df[TARGET].value_counts(normalize=True, dropna=False).round(4))
+
+    return df
+
+
+# ============================================================
+# 2. PREPARE THE TARGET AND FEATURES
+# ============================================================
+
+def prepare_target(df):
+    """Convert the target to a binary variable and remove unknown labels."""
+
+    df = df.copy()
+
+    # Convert common Boolean representations to numeric 0/1.
+    if df[TARGET].dtype == object:
+        normalized = df[TARGET].astype(str).str.strip().str.lower()
+        mapping = {
+            "true": 1,
+            "false": 0,
+            "1": 1,
+            "0": 0,
+            "yes": 1,
+            "no": 0,
+        }
+        converted = normalized.map(mapping)
+
+        # If the column contains other representations, try numeric conversion.
+        if converted.notna().sum() == 0:
+            converted = pd.to_numeric(df[TARGET], errors="coerce")
+
+        df[TARGET] = converted
+    else:
+        df[TARGET] = pd.to_numeric(df[TARGET], errors="coerce")
+
+    df = df[df[TARGET].isin([0, 1])].copy()
+    df[TARGET] = df[TARGET].astype(int)
+
+    if df.empty:
+        raise ValueError("No rows with a valid binary target remain.")
+
+    return df
+
+
+def make_features(df):
+    """
+    Create model features from available columns.
+
+    The target is excluded. Identifiers and raw dates are excluded;
+    month and weekday are represented using dummy variables.
+    """
+
+    X = pd.DataFrame(index=df.index)
+
+    # Numeric predictors: use only columns available in the dataset.
+    numeric_candidates = [
+        "cci",
+        "growth_30d",
+        "growth_snp500_30d",
+        "DGS10",
+        "DGS5",
+        "FEDFUNDS",
+    ]
+
+    for column in numeric_candidates:
+        if column in df.columns:
+            X[column] = pd.to_numeric(df[column], errors="coerce")
+
+    # Month and weekday dummy variables.
+    if "Month" in df.columns:
+        month = df["Month"]
+
+        if pd.api.types.is_numeric_dtype(month):
+            month_values = month
+        else:
+            month_values = pd.to_datetime(
+                month, errors="coerce"
+            ).dt.month
+
+        X["Month"] = month_values
+
+    elif "Date" in df.columns:
+        X["Month"] = df["Date"].dt.month
+
+    if "Weekday" in df.columns:
+        weekday = df["Weekday"]
+
+        if pd.api.types.is_numeric_dtype(weekday):
+            X["Weekday"] = weekday
+        else:
+            weekday_names = {
+                "monday": 0,
+                "tuesday": 1,
+                "wednesday": 2,
+                "thursday": 3,
+                "friday": 4,
+                "saturday": 5,
+                "sunday": 6,
+            }
+            mapped = weekday.astype(str).str.lower().map(weekday_names)
+
+            # If weekday values are not names, try numeric conversion.
+            if mapped.notna().sum() > 0:
+                X["Weekday"] = mapped
+            else:
+                X["Weekday"] = pd.to_numeric(
+                    weekday, errors="coerce"
+                )
+
+    elif "Date" in df.columns:
+        X["Weekday"] = df["Date"].dt.dayofweek
+
+    # Include additional numeric columns, excluding identifiers,
+    # the target, and columns that directly encode future outcomes.
+    excluded_names = {
+        TARGET.lower(),
+        "date",
+        "ticker",
+        "symbol",
+        "growth_30d_future",
+        "is_positive_growth_30d_future",
+    }
+
+    for column in df.columns:
+        if column in X.columns:
+            continue
+
+        if column.lower() in excluded_names:
+            continue
+
+        if column.lower().startswith("is_positive_growth"):
+            continue
+
+        if "future" in column.lower():
+            continue
+
+        if pd.api.types.is_numeric_dtype(df[column]):
+            X[column] = df[column]
+
+    # Remove duplicate columns, if any.
+    X = X.loc[:, ~X.columns.duplicated()]
+
+    # Replace infinite values with missing values.
+    X = X.replace([np.inf, -np.inf], np.nan)
+
+    # Keep columns with at least one observed value.
+    X = X.dropna(axis=1, how="all")
+
+    if X.empty:
+        raise ValueError(
+            "No usable numeric features were found. "
+            "Check the dataset's column names."
+        )
+
+    return X
+
+
+def split_and_impute(X, y):
+    """
+    Split the data and impute missing numeric values using training
+    medians only, avoiding information leakage from the test set.
+    """
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=TEST_SIZE,
+        random_state=RANDOM_STATE,
+        stratify=y if y.nunique() > 1 else None,
+    )
+
+    # Remove features entirely missing in the training subset.
+    usable_columns = X_train.columns[
+        X_train.notna().any(axis=0)
+    ]
+
+    X_train = X_train[usable_columns].copy()
+    X_test = X_test[usable_columns].copy()
+
+    medians = X_train.median(numeric_only=True)
+
+    X_train = X_train.fillna(medians).fillna(0)
+    X_test = X_test.fillna(medians).fillna(0)
+
+    return X_train, X_test, y_train, y_test
+
+
+# ============================================================
+# 3. HANDCRAFTED RULES
+# ============================================================
+
+def create_handcrafted_predictions(df):
+    """
+    Reproduce the four handcrafted rules used in the homework.
+
+    pred0: CCI > 200
+    pred1: growth_30d > 1
+    pred2: growth_30d > 1 AND growth_snp500_30d > 1
+    pred3: DGS10 <= 4.5 AND DGS5 <= 4
+    pred4: DGS10 > 4 AND FEDFUNDS <= 4.795
+    """
+
+    required_for_rules = [
+        "cci",
+        "growth_30d",
+        "growth_snp500_30d",
+        "DGS10",
+        "DGS5",
+        "FEDFUNDS",
+    ]
+
+    missing = [
+        column for column in required_for_rules
+        if column not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Cannot calculate the homework's handcrafted rules. "
+            f"Missing columns: {missing}"
+        )
+
+    predictions = pd.DataFrame(index=df.index)
+
+    predictions["pred0"] = (
+        pd.to_numeric(df["cci"], errors="coerce") > 200
+    ).astype(int)
+
+    predictions["pred1"] = (
+        pd.to_numeric(df["growth_30d"], errors="coerce") > 1
+    ).astype(int)
+
+    predictions["pred2"] = (
+        (pd.to_numeric(df["growth_30d"], errors="coerce") > 1)
+        & (
+            pd.to_numeric(
+                df["growth_snp500_30d"], errors="coerce"
+            ) > 1
+        )
+    ).astype(int)
+
+    predictions["pred3"] = (
+        (pd.to_numeric(df["DGS10"], errors="coerce") <= 4.5)
+        & (pd.to_numeric(df["DGS5"], errors="coerce") <= 4)
+    ).astype(int)
+
+    predictions["pred4"] = (
+        (pd.to_numeric(df["DGS10"], errors="coerce") > 4)
+        & (pd.to_numeric(df["FEDFUNDS"], errors="coerce") <= 4.795)
+    ).astype(int)
+
+    return predictions
+
+
+def evaluate_predictions(y_true, y_pred, name):
+    """Print classification metrics for a binary prediction."""
+
+    print(f"\n{name}")
+    print("-" * 50)
+
+    print(f"Accuracy:  {accuracy_score(y_true, y_pred):.4f}")
+    print(
+        f"Precision: "
+        f"{precision_score(y_true, y_pred, zero_division=0):.4f}"
+    )
+    print(
+        f"Recall:    "
+        f"{recall_score(y_true, y_pred, zero_division=0):.4f}"
+    )
+    print(
+        f"F1 score:  "
+        f"{f1_score(y_true, y_pred, zero_division=0):.4f}"
+    )
+
+
+# ============================================================
+# Q1. MONTH/WEEKDAY DUMMY CORRELATIONS
+# ============================================================
+
+def question_1(df):
+    print("\n" + "=" * 70)
+    print("Q1 — MONTH AND WEEKDAY DUMMY CORRELATIONS")
+    print("=" * 70)
+
+    work = df.copy()
+
+    if "Month" not in work.columns:
+        if "Date" not in work.columns:
+            print("Skipped: neither Month nor Date is available.")
+            return
+        work["Month"] = work["Date"].dt.month
+
+    if "Weekday" not in work.columns:
+        if "Date" not in work.columns:
+            print("Skipped: neither Weekday nor Date is available.")
+            return
+        work["Weekday"] = work["Date"].dt.dayofweek
+
+    # Create dummy variables for the calendar categories.
+    calendar = pd.get_dummies(
+        work[["Month", "Weekday"]].astype("category"),
+        columns=["Month", "Weekday"],
+        prefix=["month", "weekday"],
+        dtype=int,
+    )
+
+    calendar[TARGET] = work[TARGET].astype(float)
+
+    correlations = calendar.corr(numeric_only=True)[TARGET]
+    correlations = correlations.drop(TARGET).sort_values(
+        key=lambda values: values.abs(),
+        ascending=False,
+    )
+
+    print("Dummy-variable correlations with the target:")
+    print(correlations.to_string())
+
+    if not correlations.empty:
+        print(
+            "\nLargest absolute correlation:",
+            correlations.index[0],
+            f"({correlations.iloc[0]:.4f})",
+        )
+
+
+# ============================================================
+# Q2. EVALUATE HANDCRAFTED PREDICTIONS pred3 AND pred4
+# ============================================================
+
+def question_2(df, rules):
+    print("\n" + "=" * 70)
+    print("Q2 — HANDCRAFTED RULE PRECISION")
+    print("=" * 70)
+
+    y = df[TARGET]
+
+    for column in ["pred3", "pred4"]:
+        evaluate_predictions(
+            y,
+            rules[column],
+            f"{column}: {column} rule",
+        )
+
+    comparison = pd.DataFrame({
+        "rule": ["pred3", "pred4"],
+        "precision": [
+            precision_score(y, rules["pred3"], zero_division=0),
+            precision_score(y, rules["pred4"], zero_division=0),
+        ],
+        "predicted_positive_cases": [
+            int(rules["pred3"].sum()),
+            int(rules["pred4"].sum()),
+        ],
+    })
+
+    print("\nComparison:")
+    print(comparison.to_string(index=False))
+
+
+# ============================================================
+# Q3. DEPTH-10 TREE AND UNIQUE CORRECT POSITIVE PREDICTIONS
+# ============================================================
+
+def question_3(X_train, X_test, y_train, y_test, rules_test):
+    print("\n" + "=" * 70)
+    print("Q3 — DEPTH-10 DECISION TREE")
+    print("=" * 70)
+
+    tree = DecisionTreeClassifier(
+        max_depth=10,
+        random_state=RANDOM_STATE,
+    )
+    tree.fit(X_train, y_train)
+
+    ml_pred = pd.Series(
+        tree.predict(X_test),
+        index=y_test.index,
+        name="ml_prediction",
+    )
+
+    evaluate_predictions(y_test, ml_pred, "Decision tree, max_depth=10")
+
+    # Find positive cases correctly identified by the ML model
+    # but not correctly identified by either pred3 or pred4.
+    actual_positive = y_test == 1
+    ml_correct_positive = (ml_pred == 1) & actual_positive
+
+    pred3_test = rules_test.loc[y_test.index, "pred3"]
+    pred4_test = rules_test.loc[y_test.index, "pred4"]
+
+    rules_missed = (pred3_test != 1) & (pred4_test != 1)
+
+    unique_cases = ml_correct_positive & rules_missed
+
+    print(
+        "\nCases correctly predicted positive by the ML model "
+        "but missed by BOTH pred3 and pred4:"
+    )
+    print(int(unique_cases.sum()))
+
+    print("\nML positive predictions:", int((ml_pred == 1).sum()))
+    print("Actual positive cases:", int(actual_positive.sum()))
+
+    print("\nConfusion matrix (rows=actual, columns=predicted):")
+    print(confusion_matrix(y_test, ml_pred, labels=[0, 1]))
+
+    return tree, ml_pred, unique_cases
+
+
+# ============================================================
+# Q4. DECISION TREE DEPTHS 1–12
+# ============================================================
+
+def question_4(X_train, X_test, y_train, y_test):
+    print("\n" + "=" * 70)
+    print("Q4 — DECISION TREE HYPERPARAMETER TUNING")
+    print("=" * 70)
+
+    results = []
+
+    for depth in range(1, 13):
+        tree = DecisionTreeClassifier(
+            max_depth=depth,
+            random_state=RANDOM_STATE,
+        )
+        tree.fit(X_train, y_train)
+
+        pred = tree.predict(X_test)
+
+        results.append({
+            "max_depth": depth,
+            "accuracy": accuracy_score(y_test, pred),
+            "precision": precision_score(
+                y_test, pred, zero_division=0
+            ),
+            "recall": recall_score(
+                y_test, pred, zero_division=0
+            ),
+            "f1": f1_score(
+                y_test, pred, zero_division=0
+            ),
+            "predicted_positives": int((pred == 1).sum()),
+        })
+
+    results_df = pd.DataFrame(results)
+
+    print(results_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+
+    # Report the best test precision for transparency.
+    # For rigorous model selection, tune on a validation set instead
+    # of using test performance to choose the final model.
+    best_row = results_df.loc[results_df["precision"].idxmax()]
+
+    print("\nDepth with highest reported test precision:")
+    print(f"Depth: {int(best_row['max_depth'])}")
+    print(f"Precision: {best_row['precision']:.4f}")
+
+    return results_df
+
+
+# ============================================================
+# Q5. MISSING FACTORS / LIMITATIONS
+# ============================================================
+
+def question_5(df):
+    print("\n" + "=" * 70)
+    print("Q5 — WHAT INFORMATION IS MISSING?")
+    print("=" * 70)
+
+    print(
+        """
+Potentially useful information not fully represented by the current
+features includes:
+
+1. Company fundamentals:
+   Revenue, earnings, profitability, debt, cash flow, and valuation.
+
+2. Earnings and corporate events:
+   Earnings surprises, guidance changes, dividends, splits, and
+   material company announcements.
+
+3. Market expectations:
+   Analyst forecasts, revisions, sentiment, and consensus estimates.
+
+4. Market microstructure:
+   Trading volume, liquidity, bid-ask spreads, volatility, and
+   order-flow information.
+
+5. Broader market conditions:
+   Sector returns, benchmark trends, volatility indices, and
+   relevant economic indicators.
+
+6. Timing and data availability:
+   Features must reflect information available at the prediction time.
+   Using future or revised information can cause data leakage.
+
+7. Evaluation design:
+   Financial time series are chronological. A time-based train/test
+   split and validation period may give a more realistic estimate than
+   a random split.
+
+These are possible limitations and extensions, not claims that every
+listed field is absent from the dataset. Inspect the actual columns
+before concluding which information is unavailable.
+"""
+    )
+
+    print("Dataset missing-value summary (top 20 columns):")
+    missing = df.isna().sum().sort_values(ascending=False)
+    missing = missing[missing > 0].head(20)
+
+    if missing.empty:
+        print("No missing values detected in the loaded dataframe.")
+    else:
+        print(missing.to_string())
+
+
+# ============================================================
+# MAIN — RUN ALL QUESTIONS
+# ============================================================
+
+def main():
+    # Load and clean data.
+    df = load_dataset(DATA_PATH)
+    df = prepare_target(df)
+
+    print("\nRows retained after target validation:", len(df))
+
+    # Q1: Calendar dummy correlations.
+    question_1(df)
+
+    # Handcrafted rules used by Q2 and Q3.
+    rules = create_handcrafted_predictions(df)
+
+    # Q2: Evaluate pred3 and pred4 on the available labeled data.
+    question_2(df, rules)
+
+    # Prepare features for the decision-tree questions.
+    X = make_features(df)
+    y = df[TARGET]
+
+    print("\n" + "=" * 70)
+    print("MODEL DATA")
+    print("=" * 70)
+    print("Feature count:", X.shape[1])
+    print("Features:", X.columns.tolist())
+
+    X_train, X_test, y_train, y_test = split_and_impute(X, y)
+
+    print("Training rows:", len(X_train))
+    print("Testing rows:", len(X_test))
+
+    # Q3: Depth-10 model and cases unique to the ML model.
+    tree10, ml_predictions, unique_cases = question_3(
+        X_train,
+        X_test,
+        y_train,
+        y_test,
+        rules,
+    )
+
+    # Q4: Decision-tree depth comparison.
+    depth_results = question_4(
+        X_train,
+        X_test,
+        y_train,
+        y_test,
+    )
+
+    # Q5: Missing factors and data-quality overview.
+    question_5(df)
+
+    print("\n" + "=" * 70)
+    print("HOMEWORK SCRIPT FINISHED")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
